@@ -206,6 +206,8 @@ var FR = {
     "deliverability.hardBounce": "Adresses en bounce d\xE9finitif",
     "deliverability.optout": "Contacts d\xE9sinscrits",
     "deliverability.unreachable": "Contacts injoignables",
+    "deliverability.ghost": "Contacts qui n'ouvrent jamais vos emails marketing",
+    "deliverability.marketingWaste": "Contacts marketing factur\xE9s mais injoignables",
     "pipeline.deal.overdue": "Transactions \xE0 date de cl\xF4ture d\xE9pass\xE9e",
     "pipeline.deal.stalled": "Transactions au point mort (60+ jours)",
     "pipeline.deal.noAmount": "Transactions sans montant",
@@ -408,6 +410,8 @@ var EN = {
     "deliverability.hardBounce": "Hard-bounced addresses",
     "deliverability.optout": "Opted-out contacts",
     "deliverability.unreachable": "Unreachable contacts",
+    "deliverability.ghost": "Contacts who never open your marketing emails",
+    "deliverability.marketingWaste": "Marketing contacts you pay for but cannot reach",
     "pipeline.deal.overdue": "Deals past their close date",
     "pipeline.deal.stalled": "Stalled deals (60+ days idle)",
     "pipeline.deal.noAmount": "Deals without an amount",
@@ -439,7 +443,7 @@ var EN = {
   ctaLink: "Fix this automatically with Jipup",
   builtBy: "Built by"
 };
-var CTA_URL = "https://crm.jipup.com?utm_source=crm-health-check&utm_medium=html-report&utm_campaign=lead-magnet";
+var CTA_URL = "https://jipup.com?utm_source=crm-health-check&utm_medium=html-report&utm_campaign=lead-magnet";
 var ICON = {
   clock: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`,
   contact: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-8 0v2"/><circle cx="12" cy="7" r="4"/></svg>`,
@@ -990,6 +994,51 @@ function renderReportHtml(report, evidence, lang) {
 </html>`;
 }
 
+// ../shared/common/src/lib/hubspot-oauth.ts
+var HUBSPOT_OAUTH_BASE = "https://api.hubapi.com/oauth/2026-03";
+var HubspotOAuthError = class extends Error {
+  status;
+  /** RFC 6749 error code (`invalid_grant`, `invalid_client`, …) when given. */
+  error;
+  constructor(status, body) {
+    const fields = body && typeof body === "object" ? body : {};
+    const error = typeof fields.error === "string" ? fields.error : null;
+    const description = typeof fields.error_description === "string" ? fields.error_description : typeof fields.message === "string" ? fields.message : null;
+    super(
+      `HubSpot OAuth ${status}${error ? ` ${error}` : ""}${description ? `: ${description}` : ""}`
+    );
+    this.name = "HubspotOAuthError";
+    this.status = status;
+    this.error = error;
+  }
+};
+async function postForm(path, fields) {
+  const res = await fetch(`${HUBSPOT_OAUTH_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(fields)
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new HubspotOAuthError(res.status, body);
+  return body;
+}
+async function introspectHubspotToken(token, credentials, tokenTypeHint = "access_token") {
+  return postForm("/token/introspect", {
+    client_id: credentials.clientId,
+    client_secret: credentials.clientSecret,
+    token_type_hint: tokenTypeHint,
+    token
+  });
+}
+
+// engine/hubspot-credentials.ts
+function crmHubspotCredentials() {
+  const clientId = process.env.CRM_HUBSPOT_CLIENT_ID ?? process.env.NEXT_PUBLIC_HUBSPOT_CLIENT_ID ?? process.env.HUBSPOT_CLIENT_ID;
+  const clientSecret = process.env.CRM_HUBSPOT_CLIENT_SECRET ?? process.env.HUBSPOT_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return null;
+  return { clientId, clientSecret };
+}
+
 // engine/hubspot-fetch.ts
 var MAX_RETRIES = 5;
 var MAX_BACKOFF_MS = 16e3;
@@ -1025,7 +1074,7 @@ async function hubspotFetch(url, init, token) {
 }
 
 // engine/audit/constants.ts
-var AUDIT_REPORT_VERSION = 4;
+var AUDIT_REPORT_VERSION = 5;
 var HUBSPOT_BASE = "https://api.hubapi.com";
 var PAGE_SIZE = 100;
 var MAX_RECORDS_SCANNED = 2e5;
@@ -1048,6 +1097,7 @@ var SEVERITY_CRITICAL_RATIO = 0.35;
 var ANNUAL_JOB_TURNOVER = 0.3;
 var MONTHLY_JOB_TURNOVER = 1 - Math.pow(1 - ANNUAL_JOB_TURNOVER, 1 / 12);
 var MAX_STALE_PROBABILITY = 0.85;
+var GHOST_MIN_DELIVERIES = 10;
 var STALE_MONTHS = 24;
 var DORMANT_MONTHS = 12;
 var ZOMBIE_DEAL_DAYS = 60;
@@ -1063,6 +1113,7 @@ var CRITICAL_RATIO = {
   "quality.email.typo": 0.05,
   "deliverability.hardBounce": 0.1,
   "deliverability.optout": 0.25,
+  "deliverability.marketingWaste": 0.3,
   "duplicates.contacts": 0.3,
   "duplicates.companies": 0.3,
   "structure.owner.inactive": 0.2
@@ -1089,15 +1140,28 @@ var CONTACT_PROPERTIES = [
   "notes_last_contacted",
   "hubspot_owner_id",
   "hs_linkedin_url",
+  // Secondary addresses: the duplicate HubSpot cannot see on its own.
+  "hs_additional_emails",
   "hs_email_optout",
   "hs_email_bounce",
+  // The real hard-bounce property; the plain one is kept for older portals.
+  "hs_email_hard_bounce_reason_enum",
   "hs_email_hard_bounce_reason",
-  "hs_email_last_send_date"
+  "hs_email_last_send_date",
+  // Marketing email engagement, for ghost contacts.
+  "hs_email_delivered",
+  "hs_email_open",
+  "hs_email_click",
+  // Whether HubSpot bills this contact as a marketing contact. Read-only
+  // through the API: the audit can count, never flip it.
+  "hs_marketable_status"
 ];
 var COMPANY_PROPERTIES = [
   "name",
   "domain",
   "website",
+  // Secondary sites filed under the company (regional domains, old brands).
+  "hs_additional_domains",
   "city",
   "country",
   "state",
@@ -1265,17 +1329,31 @@ var OBJECTS = {
   deal: { path: "deals", properties: DEAL_PROPERTIES }
 };
 async function fetchTokenInfo(token) {
-  const res = token.startsWith("pat-") ? await hubspotFetch(
+  if (!token.startsWith("pat-")) {
+    const credentials = crmHubspotCredentials();
+    if (!credentials) {
+      console.warn("[audit] token introspection needs the OAuth client credentials; assuming optional scopes absent");
+      return { portalId: null, scopes: [] };
+    }
+    try {
+      const info = await introspectHubspotToken(token, credentials);
+      return {
+        portalId: info.hub_id != null ? String(info.hub_id) : null,
+        scopes: Array.isArray(info.scopes) ? info.scopes : []
+      };
+    } catch (e) {
+      const reason = e instanceof HubspotOAuthError ? e.status : e.message;
+      console.warn(`[audit] token introspection \u2192 ${reason}; assuming optional scopes absent`);
+      return { portalId: null, scopes: [] };
+    }
+  }
+  const res = await hubspotFetch(
     `${HUBSPOT_BASE}/oauth/v2/private-apps/get/access-token-info`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ tokenKey: token })
     },
-    token
-  ) : await hubspotFetch(
-    `${HUBSPOT_BASE}/oauth/v1/access-tokens/${encodeURIComponent(token)}`,
-    { method: "GET" },
     token
   );
   if (!res.ok) {
@@ -1756,23 +1834,28 @@ function runCompleteness(ctx, ev) {
 }
 
 // engine/audit/checks/deliverability.ts
+var HARD_BOUNCE_REASON_PROPS = [
+  "hs_email_hard_bounce_reason_enum",
+  "hs_email_hard_bounce_reason"
+];
 function runDeliverability(ctx, ev) {
   const checks = [];
   const hasEmail = ctx.contactProps.has("email");
-  const bounceProps = ["hs_email_hard_bounce_reason", "hs_email_bounce"].filter(
-    (p) => ctx.contactProps.has(p)
-  );
+  const reasonProps = HARD_BOUNCE_REASON_PROPS.filter((p) => ctx.contactProps.has(p));
+  const useBounceCounter = reasonProps.length === 0 && ctx.contactProps.has("hs_email_bounce");
   const hardBouncedIds = /* @__PURE__ */ new Set();
-  if (!hasEmail || bounceProps.length === 0) {
+  const optedOutIds = /* @__PURE__ */ new Set();
+  const ghostIds = /* @__PURE__ */ new Set();
+  if (!hasEmail || reasonProps.length === 0 && !useBounceCounter) {
     checks.push(skippedCheck("deliverability.hardBounce", "missing_property", 3));
   } else {
     let mailable = 0;
     for (const rec of ctx.contacts) {
       if (!filled(rec, "email")) continue;
       mailable++;
-      const reason = prop(rec, "hs_email_hard_bounce_reason");
+      const reason = firstFilled(rec, ...reasonProps);
       const bounces = num(rec, "hs_email_bounce");
-      if (!reason && bounces <= 0) continue;
+      if (useBounceCounter ? bounces <= 0 : !reason) continue;
       hardBouncedIds.add(rec.id);
       ev.add("deliverability.hardBounce", "contact", rec, {
         email: prop(rec, "email"),
@@ -1792,19 +1875,18 @@ function runDeliverability(ctx, ev) {
   if (!hasEmail || !ctx.contactProps.has("hs_email_optout")) {
     checks.push(skippedCheck("deliverability.optout", "missing_property", 2));
   } else {
-    let optedOut = 0;
     let mailable = 0;
     for (const rec of ctx.contacts) {
       if (!filled(rec, "email")) continue;
       mailable++;
       if (!bool(rec, "hs_email_optout")) continue;
-      optedOut++;
+      optedOutIds.add(rec.id);
       ev.add("deliverability.optout", "contact", rec, { email: prop(rec, "email") });
     }
     checks.push(
       buildCheck({
         id: "deliverability.optout",
-        affected: optedOut,
+        affected: optedOutIds.size,
         total: mailable,
         weight: 2
       })
@@ -1816,7 +1898,7 @@ function runDeliverability(ctx, ev) {
   } else {
     let unreachable = 0;
     for (const rec of ctx.contacts) {
-      const hasUsableEmail = hasEmail && filled(rec, "email") && !prop(rec, "hs_email_hard_bounce_reason");
+      const hasUsableEmail = hasEmail && filled(rec, "email") && !hardBouncedIds.has(rec.id);
       const hasPhone = phoneProps.some((p) => filled(rec, p));
       if (hasUsableEmail || hasPhone) continue;
       unreachable++;
@@ -1831,20 +1913,871 @@ function runDeliverability(ctx, ev) {
       })
     );
   }
+  const hasEngagement = ctx.contactProps.has("hs_email_delivered") && ctx.contactProps.has("hs_email_open");
+  if (!hasEmail || !hasEngagement) {
+    checks.push(skippedCheck("deliverability.ghost", "missing_property", 2));
+  } else {
+    let delivered = 0;
+    for (const rec of ctx.contacts) {
+      if (!filled(rec, "email") || hardBouncedIds.has(rec.id)) continue;
+      const sent = num(rec, "hs_email_delivered");
+      if (sent <= 0) continue;
+      delivered++;
+      if (sent < GHOST_MIN_DELIVERIES) continue;
+      if (num(rec, "hs_email_open") > 0 || num(rec, "hs_email_click") > 0) continue;
+      ghostIds.add(rec.id);
+      ev.add("deliverability.ghost", "contact", rec, {
+        email: prop(rec, "email"),
+        delivered: sent
+      });
+    }
+    checks.push(
+      buildCheck({
+        id: "deliverability.ghost",
+        affected: ghostIds.size,
+        total: delivered,
+        weight: 2,
+        meta: { minDeliveries: GHOST_MIN_DELIVERIES }
+      })
+    );
+  }
+  if (!ctx.contactProps.has("hs_marketable_status")) {
+    checks.push(skippedCheck("deliverability.marketingWaste", "missing_property", 2));
+  } else {
+    let marketing = 0;
+    const wasted = { hardBounced: 0, optedOut: 0, ghost: 0 };
+    for (const rec of ctx.contacts) {
+      if (!bool(rec, "hs_marketable_status")) continue;
+      marketing++;
+      const cause = hardBouncedIds.has(rec.id) ? "hardBounced" : optedOutIds.has(rec.id) ? "optedOut" : ghostIds.has(rec.id) ? "ghost" : null;
+      if (!cause) continue;
+      wasted[cause]++;
+      ev.add("deliverability.marketingWaste", "contact", rec, {
+        email: prop(rec, "email"),
+        cause
+      });
+    }
+    checks.push(
+      buildCheck({
+        id: "deliverability.marketingWaste",
+        affected: wasted.hardBounced + wasted.optedOut + wasted.ghost,
+        total: marketing,
+        weight: 2,
+        meta: { ...wasted, minDeliveries: GHOST_MIN_DELIVERIES }
+      })
+    );
+  }
   return { checks, findings: [], totals: { hardBouncedIds } };
 }
+
+// engine/duplicate-explanation.ts
+var REASON_EN = {
+  same_linkedin: "same LinkedIn URL",
+  same_email: "same email",
+  same_email_secondary: "same email (secondary address on one side)",
+  same_mobile: "same mobile phone",
+  same_name_phone: "same full name + same phone",
+  same_phone_name_missing: "same phone (name missing on one side)",
+  same_name_company: "same full name + same company",
+  same_name_email_domain: "same full name + same email domain root",
+  same_name_only: "same full name (no corroboration)",
+  exact_fuzzy_name: "exact + fuzzy name",
+  fuzzy_full_name: "fuzzy full name",
+  swapped_name: "same name (first/last swapped)",
+  same_email_local: "same email local part, different domain",
+  near_email_local: "near-identical email local part + same domain root",
+  same_siren: "same SIREN (legal identifier)",
+  same_domain: "same exact domain",
+  same_linkedin_corroborated: "same LinkedIn + name/domain corroboration",
+  same_linkedin_alone: "same LinkedIn (uncorroborated -> manual review)",
+  same_name_domain_root: "same name + same domain root",
+  same_domain_root_other_tld: "same domain root, different TLD",
+  same_name_city: "same name + same city",
+  fuzzy_name_same_domain: "fuzzy name + same exact domain",
+  ghost_domain_root: "ghost record (missing name) + same domain root",
+  same_name_no_domain_one_side: "same name + one side has no domain",
+  fuzzy_name_no_domain_one_side: "fuzzy name + one side has no domain",
+  same_name_different_roots: "same name + different domain roots",
+  fuzzy_name_fuzzy_root: "fuzzy name + fuzzy domain root"
+};
+var CORROBORATION_EN = {
+  same_company: "same company",
+  similar_company: "similar company",
+  same_associated_company: "same associated company",
+  same_email_domain_root: "same email domain root",
+  same_phone: "same phone",
+  none: "no corroboration"
+};
+function EVIDENCE_REASON_EN(code, corroboration) {
+  const base = REASON_EN[code];
+  return code === "exact_fuzzy_name" || code === "fuzzy_full_name" ? `${base} (${CORROBORATION_EN[corroboration ?? "none"]})` : base;
+}
+var REASON_TO_CODE = /* @__PURE__ */ new Map();
+for (const code of Object.keys(REASON_EN)) {
+  if (code === "exact_fuzzy_name" || code === "fuzzy_full_name") {
+    for (const w of Object.keys(CORROBORATION_EN)) {
+      REASON_TO_CODE.set(EVIDENCE_REASON_EN(code, w), { code, with: w });
+    }
+  } else REASON_TO_CODE.set(REASON_EN[code], { code });
+}
+
+// engine/duplicate-normalizers.ts
+function stripAccents(s) {
+  return s.normalize("NFD").replace(/[̀-ͯ]/g, "");
+}
+function str2(v) {
+  return v == null ? "" : String(v).trim();
+}
+function levenshtein(a, b, maxDist) {
+  if (a === b) return 0;
+  if (Math.abs(a.length - b.length) > maxDist) return maxDist + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      if (cur[j] < rowMin) rowMin = cur[j];
+    }
+    if (rowMin > maxDist) return maxDist + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+function oneSlipApart(a, b) {
+  if (levenshtein(a, b, 1) <= 1) return true;
+  if (a.length !== b.length) return false;
+  let i = 0;
+  while (i < a.length && a[i] === b[i]) i++;
+  if (i >= a.length - 1) return false;
+  return a[i] === b[i + 1] && a[i + 1] === b[i] && a.slice(i + 2) === b.slice(i + 2);
+}
+function words(v) {
+  return stripAccents(str2(v)).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").replace(/\s+/g, " ").trim();
+}
+var COUNTRY_NAMES = {
+  FR: ["france", "frankreich", "francia", "republique francaise", "french republic", "fra"],
+  DE: ["germany", "allemagne", "deutschland", "alemania", "germania", "deu", "ger"],
+  GB: ["united kingdom", "uk", "great britain", "britain", "royaume uni", "angleterre", "england", "scotland", "wales", "northern ireland", "gbr"],
+  US: ["united states", "united states of america", "usa", "u s a", "u s", "etats unis", "etats unis d amerique", "america", "estados unidos", "vereinigte staaten"],
+  ES: ["spain", "espagne", "espana", "spanien", "esp"],
+  IT: ["italy", "italie", "italia", "italien", "ita"],
+  BE: ["belgium", "belgique", "belgie", "belgien", "bel"],
+  CH: ["switzerland", "suisse", "schweiz", "svizzera", "che"],
+  NL: ["netherlands", "the netherlands", "pays bas", "nederland", "holland", "hollande", "niederlande", "nld"],
+  LU: ["luxembourg", "luxemburg", "lux"],
+  PT: ["portugal", "prt"],
+  AT: ["austria", "autriche", "osterreich", "aut"],
+  IE: ["ireland", "irlande", "eire", "irl"],
+  CA: ["canada", "kanada", "can"],
+  AU: ["australia", "australie", "australien", "aus"],
+  NZ: ["new zealand", "nouvelle zelande", "nzl"],
+  SE: ["sweden", "suede", "sverige", "schweden", "swe"],
+  NO: ["norway", "norvege", "norge", "norwegen", "nor"],
+  DK: ["denmark", "danemark", "danmark", "danemark", "dnk"],
+  FI: ["finland", "finlande", "suomi", "fin"],
+  PL: ["poland", "pologne", "polska", "polen", "pol"],
+  CZ: ["czech republic", "czechia", "republique tcheque", "tchequie", "cesko", "cze"],
+  HU: ["hungary", "hongrie", "magyarorszag", "hun"],
+  RO: ["romania", "roumanie", "rou"],
+  GR: ["greece", "grece", "grc"],
+  TR: ["turkey", "turkiye", "turquie", "tur"],
+  MA: ["morocco", "maroc", "mar"],
+  TN: ["tunisia", "tunisie", "tun"],
+  DZ: ["algeria", "algerie", "dza"],
+  SN: ["senegal", "sen"],
+  CI: ["ivory coast", "cote d ivoire", "civ"],
+  CM: ["cameroon", "cameroun", "cmr"],
+  EG: ["egypt", "egypte", "egy"],
+  ZA: ["south africa", "afrique du sud", "zaf"],
+  BR: ["brazil", "bresil", "brasil", "bra"],
+  MX: ["mexico", "mexique", "mex"],
+  AR: ["argentina", "argentine", "arg"],
+  CL: ["chile", "chili", "chl"],
+  CO: ["colombia", "colombie", "col"],
+  JP: ["japan", "japon", "nippon", "jpn"],
+  CN: ["china", "chine", "people s republic of china", "chn"],
+  HK: ["hong kong", "hkg"],
+  KR: ["south korea", "korea", "coree du sud", "coree", "kor"],
+  IN: ["india", "inde", "ind"],
+  SG: ["singapore", "singapour", "sgp"],
+  AE: ["united arab emirates", "uae", "emirats arabes unis", "dubai", "are"],
+  SA: ["saudi arabia", "arabie saoudite", "sau"],
+  IL: ["israel", "isr"],
+  QA: ["qatar", "qat"],
+  TH: ["thailand", "thailande", "tha"],
+  VN: ["vietnam", "viet nam", "vnm"],
+  ID: ["indonesia", "indonesie", "idn"],
+  MY: ["malaysia", "malaisie", "mys"],
+  PH: ["philippines", "phl"],
+  TW: ["taiwan", "twn"],
+  RU: ["russia", "russie", "russian federation", "rus"],
+  UA: ["ukraine", "ukr"],
+  LT: ["lithuania", "lituanie", "ltu"],
+  LV: ["latvia", "lettonie", "lva"],
+  EE: ["estonia", "estonie", "est"],
+  SK: ["slovakia", "slovaquie", "svk"],
+  SI: ["slovenia", "slovenie", "svn"],
+  HR: ["croatia", "croatie", "hrv"],
+  BG: ["bulgaria", "bulgarie", "bgr"],
+  RS: ["serbia", "serbie", "srb"],
+  CY: ["cyprus", "chypre", "cyp"],
+  MT: ["malta", "malte", "mlt"],
+  IS: ["iceland", "islande", "isl"],
+  MC: ["monaco", "mco"],
+  AD: ["andorra", "andorre", "and"],
+  LI: ["liechtenstein", "lie"]
+};
+var COUNTRY_BY_NAME = /* @__PURE__ */ new Map();
+for (const [code, names] of Object.entries(COUNTRY_NAMES)) {
+  COUNTRY_BY_NAME.set(code.toLowerCase(), code);
+  for (const n of names) COUNTRY_BY_NAME.set(n, code);
+}
+function normCountry(v) {
+  const w = words(v);
+  if (!w) return "";
+  return COUNTRY_BY_NAME.get(w) ?? "";
+}
+var TITLE_EXPANSIONS = {
+  dir: "directeur",
+  resp: "responsable",
+  dirg: "directeur general",
+  dg: "directeur general",
+  dga: "directeur general adjoint",
+  pdg: "president directeur general",
+  daf: "directeur administratif financier",
+  drh: "directeur ressources humaines",
+  dsi: "directeur systemes information",
+  rh: "ressources humaines",
+  hr: "human resources",
+  ceo: "chief executive officer",
+  cto: "chief technology officer",
+  cfo: "chief financial officer",
+  coo: "chief operating officer",
+  cmo: "chief marketing officer",
+  cro: "chief revenue officer",
+  cpo: "chief product officer",
+  cio: "chief information officer",
+  chro: "chief human resources officer",
+  cso: "chief sales officer",
+  vp: "vice president",
+  svp: "senior vice president",
+  evp: "executive vice president",
+  avp: "assistant vice president",
+  mgr: "manager",
+  sr: "senior",
+  jr: "junior",
+  asst: "assistant",
+  eng: "engineer",
+  dev: "developer",
+  bizdev: "business development",
+  sdr: "sales development representative",
+  bdr: "business development representative",
+  ops: "operations",
+  mktg: "marketing",
+  acct: "account",
+  exec: "executive",
+  pres: "president",
+  gm: "general manager",
+  md: "managing director",
+  pm: "product manager",
+  csm: "customer success manager",
+  ux: "user experience",
+  ui: "user interface",
+  it: "information technology",
+  si: "systemes information",
+  rd: "research development",
+  qa: "quality assurance",
+  ca: "chiffre affaires",
+  adv: "administration des ventes",
+  compta: "comptabilite",
+  com: "communication",
+  tech: "technique",
+  ingenieur: "ingenieur",
+  ing: "ingenieur",
+  dept: "departement",
+  cie: "compagnie",
+  intl: "international",
+  mgmt: "management"
+};
+var TITLE_STOPWORDS = /* @__PURE__ */ new Set([
+  "de",
+  "du",
+  "des",
+  "la",
+  "le",
+  "les",
+  "l",
+  "d",
+  "et",
+  "en",
+  "au",
+  "aux",
+  "a",
+  "chez",
+  "pour",
+  "sur",
+  "of",
+  "the",
+  "and",
+  "at",
+  "in",
+  "for",
+  "to",
+  "with",
+  "on"
+]);
+var GENERIC_TITLES = /* @__PURE__ */ new Set([
+  "contact",
+  "accueil",
+  "standard",
+  "direction",
+  "secretariat",
+  "administration",
+  "information",
+  "info",
+  "salarie",
+  "salariee",
+  "employe",
+  "employee",
+  "employes",
+  "staff",
+  "collaborateur",
+  "collaboratrice",
+  "membre",
+  "member",
+  "team member",
+  "personnel",
+  "worker",
+  "travailleur",
+  "professionnel",
+  "professional",
+  "cadre",
+  "stagiaire",
+  "intern",
+  "alternant",
+  "alternante",
+  "apprenti",
+  "freelance",
+  "independant",
+  "consultant",
+  "retraite",
+  "retired",
+  "etudiant",
+  "student",
+  "sans emploi",
+  "unemployed",
+  "autre",
+  "other"
+]);
+function normJobTitle(v) {
+  const w = words(v);
+  if (!w || GENERIC_TITLES.has(w)) return "";
+  const tokens = w.split(" ").flatMap((t) => (TITLE_EXPANSIONS[t] ?? t).split(" ")).filter((t) => t && !TITLE_STOPWORDS.has(t));
+  const out = [...new Set(tokens)].join(" ");
+  return GENERIC_TITLES.has(out) ? "" : out;
+}
+function tokenSet(s) {
+  return new Set(s.split(" ").filter(Boolean));
+}
+function compareJobTitles(a, b) {
+  if (!a || !b) return "unknown";
+  if (a === b) return "same";
+  const ta = tokenSet(a);
+  const tb = tokenSet(b);
+  let inter = 0;
+  for (const t of ta) if (tb.has(t)) inter++;
+  if (inter === 0) return "different";
+  const union = ta.size + tb.size - inter;
+  const jaccard2 = inter / union;
+  if (jaccard2 >= 0.75) return "same";
+  if (inter === ta.size || inter === tb.size) return "close";
+  return jaccard2 >= 0.5 ? "close" : "unknown";
+}
+var DIMINUTIVES = {
+  bob: ["robert"],
+  rob: ["robert"],
+  bobby: ["robert"],
+  bert: ["robert", "albert", "herbert"],
+  alex: ["alexandre", "alexander", "alexandra", "alexis", "alexia"],
+  tom: ["thomas"],
+  tommy: ["thomas"],
+  kate: ["katherine", "katharine", "catherine", "kathleen"],
+  katie: ["katherine", "katharine", "catherine"],
+  kathy: ["katherine", "kathleen", "catherine"],
+  cathy: ["catherine"],
+  kat: ["katherine", "catherine"],
+  bill: ["william"],
+  will: ["william"],
+  billy: ["william"],
+  liam: ["william"],
+  liz: ["elizabeth", "elisabeth"],
+  beth: ["elizabeth", "elisabeth"],
+  betty: ["elizabeth"],
+  lisa: ["elizabeth", "elisabeth"],
+  jim: ["james"],
+  jimmy: ["james"],
+  jamie: ["james"],
+  mike: ["michael"],
+  mick: ["michael"],
+  mikey: ["michael"],
+  dave: ["david"],
+  davy: ["david"],
+  dan: ["daniel"],
+  danny: ["daniel"],
+  chris: ["christopher", "christophe", "christian", "christine", "christina", "christiane"],
+  steph: ["stephanie", "stephane", "stephen", "steven"],
+  steve: ["stephen", "steven"],
+  fred: ["frederic", "frederick", "frederik", "alfred"],
+  freddy: ["frederic", "frederick"],
+  ben: ["benjamin", "benoit", "benedict"],
+  benj: ["benjamin"],
+  sam: ["samuel", "samantha"],
+  sammy: ["samuel", "samantha"],
+  matt: ["matthew", "matthieu", "mathieu"],
+  nick: ["nicolas", "nicholas"],
+  nico: ["nicolas", "nicholas"],
+  tony: ["anthony", "antoine", "antonio"],
+  pat: ["patrick", "patricia"],
+  paddy: ["patrick"],
+  tricia: ["patricia"],
+  trish: ["patricia"],
+  max: ["maxime", "maximilien", "maximilian", "maxence"],
+  seb: ["sebastien", "sebastian"],
+  greg: ["gregory", "gregoire"],
+  phil: ["philippe", "philip", "phillip"],
+  joe: ["joseph"],
+  joey: ["joseph"],
+  jo: ["joseph", "josephine", "joanne"],
+  jon: ["jonathan"],
+  jonny: ["jonathan"],
+  johnny: ["john", "jonathan"],
+  jack: ["john"],
+  ed: ["edward", "edouard", "edmond", "edgar"],
+  eddie: ["edward", "edouard"],
+  ted: ["edward", "theodore"],
+  andy: ["andrew", "andre"],
+  drew: ["andrew"],
+  harry: ["henry", "harold"],
+  hank: ["henry"],
+  rick: ["richard"],
+  dick: ["richard"],
+  rich: ["richard"],
+  ricky: ["richard"],
+  ron: ["ronald"],
+  ronnie: ["ronald"],
+  don: ["donald"],
+  donny: ["donald"],
+  ken: ["kenneth"],
+  kenny: ["kenneth"],
+  charlie: ["charles"],
+  chuck: ["charles"],
+  charly: ["charles"],
+  larry: ["lawrence", "laurence", "laurent"],
+  jerry: ["gerald", "jerome", "gerard"],
+  gerry: ["gerald", "gerard"],
+  terry: ["terence"],
+  pete: ["peter"],
+  gabe: ["gabriel"],
+  nat: ["nathalie", "natalie", "nathan", "nathaniel"],
+  nate: ["nathan", "nathaniel"],
+  vic: ["victor", "victoria"],
+  vicky: ["victoria"],
+  val: ["valerie", "valentin", "valentine"],
+  manu: ["emmanuel", "emmanuelle", "manuel"],
+  flo: ["florence", "florent", "florian"],
+  caro: ["caroline", "carole"],
+  isa: ["isabelle", "isabel", "isabella"],
+  elo: ["elodie"],
+  mat: ["mathieu", "matthieu", "mathilde"],
+  gab: ["gabriel", "gabrielle"],
+  dom: ["dominique", "dominic"],
+  jc: ["jean claude", "jean christophe"],
+  jp: ["jean pierre", "jean philippe", "jean paul"],
+  jf: ["jean francois"],
+  jm: ["jean marc", "jean michel", "jean marie"],
+  pa: ["pierre alexandre", "pierre antoine"],
+  pe: ["pierre emmanuel"],
+  mc: ["marie christine", "marie claire", "marie claude"],
+  mp: ["marie pierre"],
+  al: ["albert", "alan", "alfred", "allan"],
+  ali: ["alison", "alice"],
+  sue: ["susan", "suzanne"],
+  susie: ["susan", "suzanne"],
+  peggy: ["margaret"],
+  meg: ["margaret", "megan"],
+  maggie: ["margaret"],
+  nancy: ["ann", "anne"],
+  sally: ["sarah"],
+  molly: ["mary"],
+  polly: ["mary"],
+  becky: ["rebecca"],
+  becca: ["rebecca"],
+  jen: ["jennifer"],
+  jenny: ["jennifer"],
+  jess: ["jessica"],
+  jessie: ["jessica"],
+  abby: ["abigail"],
+  gus: ["augustin", "auguste", "augustus"],
+  oli: ["olivier", "oliver", "olivia"],
+  ollie: ["oliver"]
+};
+var FEMININE_ENDINGS = ["e", "ne", "le", "ine", "ette", "tte", "elle", "te", "que", "a"];
+function feminineOf(short, long) {
+  if (long.length <= short.length) return false;
+  if (!long.startsWith(short)) return false;
+  return FEMININE_ENDINGS.includes(long.slice(short.length));
+}
+function finalVowelSwap(a, b) {
+  if (a.length !== b.length || a.length < 4) return false;
+  if (a.slice(0, -1) !== b.slice(0, -1)) return false;
+  const ends = /* @__PURE__ */ new Set([a[a.length - 1], b[b.length - 1]]);
+  return ends.has("a") && ends.has("e");
+}
+function firstNameTokens(v) {
+  return words(v).split(" ").filter(Boolean);
+}
+function initialOf(token, other) {
+  return token.length === 1 && other.length > 1 && other[0] === token;
+}
+function tokensCompatible(a, b) {
+  if (a === b) return true;
+  if (initialOf(a, b) || initialOf(b, a)) return true;
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  if (feminineOf(short, long) || finalVowelSwap(a, b)) return false;
+  if (DIMINUTIVES[a]?.includes(b) || DIMINUTIVES[b]?.includes(a)) return true;
+  return a.length >= 4 && b.length >= 4 && levenshtein(a, b, 1) <= 1;
+}
+function firstNamesCompatible(a, b) {
+  const ta = firstNameTokens(a);
+  const tb = firstNameTokens(b);
+  if (ta.length === 0 || tb.length === 0) return true;
+  const [fewer, more] = ta.length <= tb.length ? [ta, tb] : [tb, ta];
+  if (fewer.length === 1 && /^[a-z]{2,3}$/.test(fewer[0]) && more.length === fewer[0].length) {
+    if (more.every((t, i) => t[0] === fewer[0][i])) return true;
+  }
+  if (fewer.length === 1 && more.length > 1) {
+    const joined = more.join(" ");
+    if (DIMINUTIVES[fewer[0]]?.includes(joined)) return true;
+  }
+  return fewer.every((t) => more.some((u) => tokensCompatible(t, u)));
+}
+var GENERIC_LOCALS = /* @__PURE__ */ new Set([
+  "info",
+  "infos",
+  "contact",
+  "hello",
+  "bonjour",
+  "hi",
+  "sales",
+  "vente",
+  "ventes",
+  "commercial",
+  "commerce",
+  "admin",
+  "administration",
+  "office",
+  "bureau",
+  "support",
+  "help",
+  "aide",
+  "service",
+  "services",
+  "serviceclient",
+  "service-client",
+  "customer",
+  "customers",
+  "clients",
+  "client",
+  "direction",
+  "management",
+  "rh",
+  "hr",
+  "jobs",
+  "job",
+  "careers",
+  "career",
+  "recrutement",
+  "recruitment",
+  "recruiting",
+  "candidature",
+  "candidatures",
+  "marketing",
+  "com",
+  "communication",
+  "presse",
+  "press",
+  "media",
+  "compta",
+  "comptabilite",
+  "accounting",
+  "accounts",
+  "finance",
+  "billing",
+  "facturation",
+  "invoice",
+  "invoices",
+  "noreply",
+  "no-reply",
+  "no_reply",
+  "donotreply",
+  "newsletter",
+  "news",
+  "team",
+  "equipe",
+  "accueil",
+  "welcome",
+  "reception",
+  "partenariats",
+  "partners",
+  "partnership",
+  "partnerships",
+  "webmaster",
+  "postmaster",
+  "hostmaster",
+  "abuse",
+  "security",
+  "it",
+  "informatique",
+  "dev",
+  "tech",
+  "technique",
+  "secretariat",
+  "assistant",
+  "assistante",
+  "general",
+  "mail",
+  "email",
+  "courrier",
+  "legal",
+  "juridique",
+  "dpo",
+  "privacy",
+  "rgpd",
+  "gdpr",
+  "order",
+  "orders",
+  "commande",
+  "commandes",
+  "achat",
+  "achats",
+  "purchasing",
+  "export",
+  "import",
+  "logistique",
+  "logistics",
+  "qualite",
+  "quality",
+  "formation",
+  "training",
+  "events",
+  "evenements",
+  "store",
+  "shop",
+  "boutique",
+  "agence",
+  "agency"
+]);
+var alnum = (s) => s.replace(/[^a-z0-9]/g, "");
+function isGenericEmailLocal(local) {
+  const l = stripAccents(local.toLowerCase());
+  return GENERIC_LOCALS.has(l) || GENERIC_LOCALS.has(alnum(l));
+}
+function localsDerivedFrom(first, last) {
+  const out = /* @__PURE__ */ new Set();
+  const f = alnum(words(first).replace(/ /g, ""));
+  const l = alnum(words(last).replace(/ /g, ""));
+  const ft = words(first).split(" ").filter(Boolean);
+  const firsts = new Set([f, ...ft.map(alnum), ft.map((t) => alnum(t)[0] ?? "").join("")].filter(Boolean));
+  for (const fi of firsts) {
+    if (l) {
+      out.add(fi + l);
+      out.add(l + fi);
+      out.add(fi[0] + l);
+      out.add(l + fi[0]);
+      out.add(fi + l[0]);
+    }
+    out.add(fi);
+  }
+  if (l) out.add(l);
+  return out;
+}
+function emailLocalsCompatible(localA, localB, names) {
+  const a = alnum(stripAccents(localA.toLowerCase()));
+  const b = alnum(stripAccents(localB.toLowerCase()));
+  if (!a || !b || a === b) return true;
+  if (isGenericEmailLocal(localA) || isGenericEmailLocal(localB)) return true;
+  if (a.includes(b) || b.includes(a)) return true;
+  for (const n of names) {
+    if (!n.first && !n.last) continue;
+    const derived = localsDerivedFrom(n.first, n.last);
+    if (derived.has(a) && derived.has(b)) return true;
+  }
+  return false;
+}
+function normZip(v) {
+  const s = str2(v).toUpperCase().replace(/[\s.]/g, "");
+  if (!/^[A-Z0-9-]{3,10}$/.test(s)) return "";
+  if (/^(\d)\1+$/.test(s) || s === "12345") return "";
+  return s;
+}
+var ADDRESS_WORDS = {
+  av: "avenue",
+  ave: "avenue",
+  bd: "boulevard",
+  bld: "boulevard",
+  blvd: "boulevard",
+  pl: "place",
+  rte: "route",
+  ch: "chemin",
+  imp: "impasse",
+  all: "allee",
+  sq: "square",
+  crs: "cours",
+  qu: "quai",
+  fg: "faubourg",
+  fbg: "faubourg",
+  res: "residence",
+  bat: "batiment",
+  st: "saint",
+  ste: "sainte",
+  str: "strasse",
+  rd: "road",
+  dr: "drive",
+  ln: "lane",
+  ct: "court"
+};
+function normAddress(v) {
+  const w = words(v);
+  if (!w) return "";
+  return w.split(" ").map((t) => ADDRESS_WORDS[t] ?? t).join(" ");
+}
+function normEmployees(v) {
+  const s = str2(v).replace(/[\s,]/g, "");
+  if (!s) return null;
+  const m = s.match(/^(\d+)(?:-(\d+)|\+)?$/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+function normYear(v) {
+  const m = str2(v).match(/\b(1[5-9]\d{2}|20\d{2})\b/);
+  if (!m) return null;
+  const y = Number(m[1]);
+  return y <= (/* @__PURE__ */ new Date()).getFullYear() + 1 ? y : null;
+}
+
+// engine/duplicate-weights.ts
+var BONUS_CAP = 15;
+var MAX_SCORE = 100;
+var CONTACT_BONUS = {
+  same_email_domain: 5,
+  same_company: 5,
+  same_job_title: 5,
+  second_identifier: 5,
+  same_location: 3,
+  email_matches_website: 3
+};
+var CONTACT_MALUS = {
+  different_mobile: 10,
+  different_country: 10,
+  different_email_person: 10,
+  different_job_title: 3
+};
+var COMPANY_BONUS = {
+  same_phone: 5,
+  same_zip: 5,
+  same_address: 5,
+  same_industry: 3,
+  same_country: 3,
+  same_founded_year: 3
+};
+var COMPANY_MALUS = {
+  different_country: 15,
+  different_founded_year: 10,
+  incompatible_employees: 5,
+  different_zip: 5,
+  different_phone: 3
+};
+var FOUNDED_YEAR_TOLERANCE = 2;
+var EMPLOYEES_RATIO = 10;
+var EMPLOYEES_MIN = 10;
 
 // engine/agents/duplicate-scoring.ts
 var MIN_SCORE_TO_CONSIDER = {
   contact: 65,
   company: 70
 };
-function stripAccents(s) {
-  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+var EMPTY_SCORE = () => ({
+  score: 0,
+  baseScore: 0,
+  reasons: [],
+  evidence: [],
+  bonus: [],
+  malus: [],
+  vetos: []
+});
+function scoreSheet() {
+  const out = EMPTY_SCORE();
+  const hit = (score, code, values, corroboration) => {
+    out.reasons.push(EVIDENCE_REASON_EN(code, corroboration));
+    const shared = values?.filter(Boolean) ?? [];
+    out.evidence.push({
+      code,
+      score,
+      ...shared.length > 0 ? { values: shared } : {},
+      ...corroboration ? { with: corroboration } : {}
+    });
+    if (score > out.baseScore) out.baseScore = score;
+  };
+  const adjust = (list, code, points, values) => {
+    const shown = values?.filter(Boolean) ?? [];
+    list.push({ code, points, ...shown.length > 0 ? { values: shown } : {} });
+  };
+  const bonus = (code, points, values) => adjust(out.bonus, code, points, values);
+  const malus = (code, points, values) => adjust(out.malus, code, -points, values);
+  const veto = (code, a, b) => out.vetos.push({ code, values: [a, b] });
+  const settle = () => {
+    const plus = Math.min(out.bonus.reduce((n, x) => n + x.points, 0), BONUS_CAP);
+    const minus = out.malus.reduce((n, x) => n + x.points, 0);
+    out.score = Math.max(0, Math.min(MAX_SCORE, out.baseScore + plus + minus));
+    return out;
+  };
+  const consumed = () => {
+    const set = /* @__PURE__ */ new Set();
+    for (const e of out.evidence) {
+      if (e.score !== out.baseScore) continue;
+      for (const s of RULE_SIGNALS[e.code] ?? []) set.add(s);
+      if (e.with) for (const s of CORROBORATION_SIGNALS[e.with] ?? []) set.add(s);
+    }
+    return set;
+  };
+  return { out, hit, bonus, malus, veto, settle, consumed };
 }
-function str2(v) {
-  return v == null ? "" : String(v).trim();
-}
+var RULE_SIGNALS = {
+  same_linkedin: ["linkedin"],
+  same_email: ["email", "email_domain"],
+  same_email_secondary: ["email", "email_domain"],
+  same_mobile: ["mobile", "phone"],
+  same_name_phone: ["name", "phone", "mobile"],
+  same_phone_name_missing: ["phone", "mobile"],
+  same_name_company: ["name", "company"],
+  same_name_email_domain: ["name", "email_domain"],
+  same_name_only: ["name"],
+  exact_fuzzy_name: ["name"],
+  fuzzy_full_name: ["name"],
+  swapped_name: ["name"],
+  same_email_local: ["email"],
+  near_email_local: ["email", "email_domain"]
+};
+var CORROBORATION_SIGNALS = {
+  same_company: ["company"],
+  similar_company: ["company"],
+  same_associated_company: ["company"],
+  same_email_domain_root: ["email_domain"],
+  same_phone: ["phone", "mobile"]
+};
 var PLACEHOLDER_VALUES = /* @__PURE__ */ new Set([
   "n/a",
   "na",
@@ -1876,17 +2809,129 @@ function junkToEmpty(s) {
   if (!/[\p{L}\p{N}]/u.test(s)) return "";
   return PLACEHOLDER_VALUES.has(s) ? "" : s;
 }
-var LEGAL_FORMS = /\b(sa|sas|sarl|sasu|eurl|inc|llc|ltd|gmbh|corp|corporation|company|co|group|groupe|holding|holdings|sl|srl|bv|ag|plc|limited)\b/g;
+var LEGAL_SUFFIXES = /\b(sa|sas|sarl|sasu|eurl|inc|llc|ltd|gmbh|corp|corporation|company|co|sl|srl|bv|ag|plc|limited)\b/g;
+var GROUP_WORDS = /\b(group|groupe|holding|holdings)\b/g;
 function normName(v) {
-  return junkToEmpty(stripAccents(str2(v)).toLowerCase().replace(/\s+/g, " ").trim());
+  const s = stripAccents(str2(v)).toLowerCase().replace(/\s+/g, " ").trim();
+  if (!junkToEmpty(s)) return "";
+  return s.replace(/['’`]/g, "").replace(/[^\p{L}\p{N}]+/gu, " ").replace(/\s+/g, " ").trim();
 }
-function normCompanyName(v) {
+function normCompanyNameWith(v, stripGroupWords) {
   let s = str2(v);
   const m = s.match(/^\s*(.+?)\s*,\s*(.+?)\s*$/);
   if (m && m[1].toLowerCase() === m[2].toLowerCase()) s = m[1];
   s = stripAccents(s).toLowerCase();
   if (!junkToEmpty(s.trim())) return "";
-  return s.replace(LEGAL_FORMS, " ").replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+  if (stripGroupWords) s = s.replace(GROUP_WORDS, " ");
+  return s.replace(LEGAL_SUFFIXES, " ").replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+}
+function normCompanyIdentity(v) {
+  return normCompanyNameWith(v, false);
+}
+var PUBLIC_EMAIL_ROOTS = /* @__PURE__ */ new Set([
+  "gmail",
+  "googlemail",
+  "hotmail",
+  "outlook",
+  "live",
+  "msn",
+  "yahoo",
+  "ymail",
+  "rocketmail",
+  "aol",
+  "icloud",
+  "me",
+  "mac",
+  "protonmail",
+  "proton",
+  "pm",
+  "gmx",
+  "yandex",
+  "qq",
+  "163",
+  "126",
+  "mail",
+  "web",
+  "t-online",
+  "zoho",
+  "fastmail",
+  "tutanota",
+  "tuta",
+  "hey",
+  "posteo",
+  "mailbox",
+  "hushmail",
+  "rediffmail",
+  "libero",
+  "virgilio",
+  "tiscali",
+  "btinternet",
+  "ntlworld",
+  "bigpond",
+  "optusnet",
+  "xtra",
+  "sympatico",
+  "videotron",
+  "comcast",
+  "sbcglobal",
+  "bellsouth",
+  "verizon",
+  "att",
+  "cox",
+  "charter",
+  "rogers",
+  "shaw",
+  "telenet",
+  "skynet",
+  "bluewin",
+  "sunrise",
+  "naver",
+  "daum",
+  "hanmail"
+]);
+var PUBLIC_EMAIL_DOMAINS = /* @__PURE__ */ new Set([
+  "orange.fr",
+  "wanadoo.fr",
+  "free.fr",
+  "sfr.fr",
+  "laposte.net",
+  "bbox.fr",
+  "neuf.fr",
+  "numericable.fr",
+  "aliceadsl.fr",
+  "club-internet.fr",
+  "voila.fr",
+  "cegetel.net",
+  "nordnet.fr",
+  "dbmail.com",
+  "sky.com",
+  "virginmedia.com",
+  "telefonica.net",
+  "terra.com",
+  "uol.com.br",
+  "bol.com.br",
+  "ig.com.br",
+  "wp.pl",
+  "onet.pl",
+  "o2.pl",
+  "seznam.cz",
+  "centrum.cz",
+  "abv.bg",
+  "freenet.de",
+  "arcor.de",
+  "online.de",
+  "ziggo.nl",
+  "kpnmail.nl",
+  "home.nl",
+  "planet.nl",
+  "hetnet.nl",
+  "telia.com",
+  "telenor.no",
+  "online.no"
+]);
+function isPublicEmailDomain(domain) {
+  if (!domain) return false;
+  return PUBLIC_EMAIL_DOMAINS.has(domain) || PUBLIC_EMAIL_ROOTS.has(domainCoreOf(domain));
 }
 function normEmail(v) {
   const s = stripAccents(str2(v).toLowerCase());
@@ -1903,6 +2948,25 @@ function phoneTailOf(...values) {
     if (/^(\d)\1{8}$/.test(tail)) continue;
     return tail;
   }
+  return "";
+}
+function splitMulti(primary, extra, norm) {
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  const push = (v) => {
+    if (v && !seen.has(v)) {
+      seen.add(v);
+      out.push(v);
+    }
+  };
+  push(primary);
+  for (const part of str2(extra).split(/[;,\s]+/)) push(norm(part));
+  return out;
+}
+function sharedValue(a, b) {
+  if (a.length === 0 || b.length === 0) return "";
+  const setB = new Set(b);
+  for (const v of a) if (setB.has(v)) return v;
   return "";
 }
 function cleanLinkedin(v) {
@@ -1956,23 +3020,6 @@ function domainCoreOf(domain) {
   const depth = TWO_LEVEL_TLDS.has(lastTwo) ? 3 : 2;
   return parts.length < depth ? parts[0] : parts[parts.length - depth];
 }
-function levenshtein(a, b, maxDist) {
-  if (a === b) return 0;
-  if (Math.abs(a.length - b.length) > maxDist) return maxDist + 1;
-  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
-  for (let i = 1; i <= a.length; i++) {
-    const cur = [i];
-    let rowMin = i;
-    for (let j = 1; j <= b.length; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
-      if (cur[j] < rowMin) rowMin = cur[j];
-    }
-    if (rowMin > maxDist) return maxDist + 1;
-    prev = cur;
-  }
-  return prev[b.length];
-}
 function jaccard(a, b) {
   if (a.length === 0 || b.length === 0) return 0;
   const setA = new Set(a);
@@ -1997,15 +3044,21 @@ function normalizeContact(id, p) {
   const emailDomain2 = at > 0 ? email.slice(at + 1) : "";
   const first = normName(p.firstname);
   const last = normName(p.lastname);
-  const company = normCompanyName(p.company);
+  const company = normCompanyIdentity(p.company);
+  const mobileTail = phoneTailOf(p.mobilephone);
+  const landlineTail = phoneTailOf(p.phone);
   return {
     id: String(id),
     email,
+    emails: splitMulti(email, p.hs_additional_emails, normEmail),
     emailLocal: emailLocal2,
     emailLocalCore: emailLocal2.replace(/[^a-z0-9]/g, ""),
     emailDomain: emailDomain2,
     emailDomainCore: domainCoreOf(emailDomain2),
-    phoneTail: phoneTailOf(p.phone, p.mobilephone),
+    emailDomainPublic: isPublicEmailDomain(emailDomain2),
+    mobileTail,
+    landlineTail,
+    phoneTails: [...new Set([mobileTail, landlineTail].filter(Boolean))],
     first,
     last,
     fullname: `${first} ${last}`.trim(),
@@ -2013,152 +3066,356 @@ function normalizeContact(id, p) {
     companyTokens: company.split(" ").filter(Boolean),
     associatedCompanyId: str2(p.associatedcompanyid),
     linkedin: normLinkedin(p.hs_linkedin_url),
-    createdate: str2(p.createdate)
+    createdate: str2(p.createdate),
+    jobTitle: normJobTitle(p.jobtitle),
+    country: normCountry(p.country),
+    city: normName(p.city),
+    zip: normZip(p.zip),
+    websiteCore: domainCoreOf(normDomain(p.website))
   };
 }
+function linkedinKind(url) {
+  return /\/in\/acwaa/.test(url) ? "member_id" : "slug";
+}
+function both(a, b) {
+  return a && a === b ? a : "";
+}
+function differ(a, b) {
+  return Boolean(a && b && a !== b);
+}
+function contactAdjustments(a, b, sheet) {
+  const used = sheet.consumed();
+  const { bonus, malus, veto } = sheet;
+  if (differ(a.linkedin, b.linkedin) && linkedinKind(a.linkedin) === linkedinKind(b.linkedin)) {
+    veto("different_linkedin", a.linkedin, b.linkedin);
+  }
+  const swapped = Boolean(a.first && a.last && a.first === b.last && a.last === b.first);
+  if (!swapped && !firstNamesCompatible(a.first, b.first)) veto("incompatible_first_names", a.first, b.first);
+  const domainRoot = sharedCompanyDomainRoot(a, b);
+  const twoPeople = Boolean(domainRoot) && differ(a.emailLocal, b.emailLocal) && !oneSlipApart(a.emailLocalCore, b.emailLocalCore) && !emailLocalsCompatible(a.emailLocal, b.emailLocal, [
+    { first: a.first, last: a.last },
+    { first: b.first, last: b.last }
+  ]);
+  if (domainRoot && !twoPeople && !used.has("email_domain")) {
+    bonus("same_email_domain", CONTACT_BONUS.same_email_domain, [domainRoot]);
+  }
+  const companyMatch = both(a.company, b.company) || both(a.associatedCompanyId, b.associatedCompanyId) || jaccard(a.companyTokens, b.companyTokens) >= 0.7;
+  if (companyMatch && !used.has("company")) bonus("same_company", CONTACT_BONUS.same_company, [both(a.company, b.company)]);
+  const roleRecord = (c) => Boolean(c.jobTitle) && c.jobTitle === normJobTitle(c.fullname);
+  const titles = roleRecord(a) || roleRecord(b) ? "unknown" : compareJobTitles(a.jobTitle, b.jobTitle);
+  if (titles === "same") bonus("same_job_title", CONTACT_BONUS.same_job_title, [a.jobTitle]);
+  const secondId = !used.has("linkedin") && both(a.linkedin, b.linkedin) || !used.has("email") && sharedValue(a.emails, b.emails) || !used.has("mobile") && both(a.mobileTail, b.mobileTail);
+  if (secondId) bonus("second_identifier", CONTACT_BONUS.second_identifier, [secondId]);
+  const place = both(a.city, b.city) || both(a.country, b.country);
+  if (place) bonus("same_location", CONTACT_BONUS.same_location, [place]);
+  if (a.websiteCore && b.websiteCore && !a.emailDomainPublic && !b.emailDomainPublic && a.emailDomainCore === a.websiteCore && b.emailDomainCore === b.websiteCore) {
+    bonus("email_matches_website", CONTACT_BONUS.email_matches_website);
+  }
+  if (differ(a.mobileTail, b.mobileTail)) malus("different_mobile", CONTACT_MALUS.different_mobile, [a.mobileTail, b.mobileTail]);
+  if (differ(a.country, b.country)) malus("different_country", CONTACT_MALUS.different_country, [a.country, b.country]);
+  if (twoPeople) malus("different_email_person", CONTACT_MALUS.different_email_person, [a.emailLocal, b.emailLocal]);
+  if (titles === "different") malus("different_job_title", CONTACT_MALUS.different_job_title, [a.jobTitle, b.jobTitle]);
+}
+function sharedCompanyDomainRoot(a, b) {
+  if (a.emailDomainPublic || b.emailDomainPublic) return "";
+  return a.emailDomainCore && a.emailDomainCore === b.emailDomainCore ? a.emailDomainCore : "";
+}
 function contactCorroboration(a, b) {
-  if (a.company && a.company === b.company) return "same company";
-  if (jaccard(a.companyTokens, b.companyTokens) >= 0.7) return "similar company";
+  if (a.company && a.company === b.company) return "same_company";
+  if (jaccard(a.companyTokens, b.companyTokens) >= 0.7) return "similar_company";
   if (a.associatedCompanyId && a.associatedCompanyId === b.associatedCompanyId)
-    return "same associated company";
-  if (a.emailDomainCore && a.emailDomainCore === b.emailDomainCore)
-    return "same email domain root";
-  if (a.phoneTail && a.phoneTail === b.phoneTail) return "same phone";
+    return "same_associated_company";
+  if (sharedCompanyDomainRoot(a, b)) return "same_email_domain_root";
+  if (sharedValue(a.phoneTails, b.phoneTails)) return "same_phone";
   return null;
 }
 function scoreContactPair(a, b) {
-  let score = 0;
-  const reasons = [];
-  const hit = (s, r) => {
-    reasons.push(r);
-    if (s > score) score = s;
-  };
-  if (a.linkedin && a.linkedin === b.linkedin) hit(100, "same LinkedIn URL");
-  if (a.email && a.email === b.email) hit(95, "same email");
-  if (a.phoneTail && a.phoneTail === b.phoneTail) hit(85, "same phone (last 9 digits)");
+  const sheet = scoreSheet();
+  const { hit } = sheet;
+  if (a.linkedin && a.linkedin === b.linkedin) hit(100, "same_linkedin", [a.linkedin]);
+  const sharedEmail = sharedValue(a.emails, b.emails);
+  if (sharedEmail) {
+    hit(
+      95,
+      sharedEmail === a.email && sharedEmail === b.email ? "same_email" : "same_email_secondary",
+      [sharedEmail]
+    );
+  }
+  const sameFullName = Boolean(a.fullname && a.fullname === b.fullname);
+  const sharedPhone = sharedValue(a.phoneTails, b.phoneTails);
+  if (a.mobileTail && a.mobileTail === b.mobileTail) hit(85, "same_mobile", [a.mobileTail]);
+  if (sharedPhone) {
+    if (sameFullName) hit(85, "same_name_phone", [a.fullname, sharedPhone]);
+    else if (!a.fullname || !b.fullname) hit(70, "same_phone_name_missing", [sharedPhone]);
+  }
   const companyMatch = a.company && a.company === b.company || a.associatedCompanyId && a.associatedCompanyId === b.associatedCompanyId || jaccard(a.companyTokens, b.companyTokens) >= 0.7;
-  if (a.fullname && a.fullname === b.fullname) {
-    if (companyMatch) hit(80, "same full name + same company");
-    else if (a.emailDomainCore && a.emailDomainCore === b.emailDomainCore)
-      hit(75, "same full name + same email domain root");
-    else hit(70, "same full name (no corroboration)");
+  if (sameFullName) {
+    const domainRoot = sharedCompanyDomainRoot(a, b);
+    if (companyMatch)
+      hit(80, "same_name_company", [a.fullname, a.company === b.company ? a.company : ""]);
+    else if (domainRoot) hit(75, "same_name_email_domain", [a.fullname, domainRoot]);
+    else hit(70, "same_name_only", [a.fullname]);
   }
   const corrob = contactCorroboration(a, b);
   const exactPlusFuzzy = a.first && a.first === b.first && fuzzyNamePart(a.last, b.last) || a.last && a.last === b.last && fuzzyNamePart(a.first, b.first);
-  if (exactPlusFuzzy) {
-    if (corrob) hit(75, `exact + fuzzy name (${corrob})`);
-    else hit(65, "exact + fuzzy name (no corroboration)");
-  }
-  if (fuzzyFullName(a.fullname, b.fullname)) {
-    if (corrob) hit(70, `fuzzy full name (${corrob})`);
-    else hit(65, "fuzzy full name (no corroboration)");
-  }
+  if (exactPlusFuzzy) hit(corrob ? 75 : 65, "exact_fuzzy_name", void 0, corrob ?? "none");
+  if (fuzzyFullName(a.fullname, b.fullname)) hit(corrob ? 70 : 65, "fuzzy_full_name", void 0, corrob ?? "none");
   if (a.first && a.last && a.first === b.last && a.last === b.first) {
-    hit(70, "same name (first/last swapped)");
+    hit(70, "swapped_name");
   }
   if (a.emailLocal && b.emailLocal && a.emailLocal === b.emailLocal && a.emailDomain !== b.emailDomain) {
-    hit(65, "same email local part, different domain");
+    hit(65, "same_email_local", [a.emailLocal]);
   }
   if (a.emailLocalCore.length >= 5 && b.emailLocalCore.length >= 5 && a.emailLocal !== b.emailLocal && a.emailDomainCore && a.emailDomainCore === b.emailDomainCore && levenshtein(a.emailLocalCore, b.emailLocalCore, 1) <= 1) {
-    hit(75, "near-identical email local part + same domain root");
+    hit(75, "near_email_local", [a.emailDomainCore]);
   }
-  return { score, reasons };
+  if (sheet.out.baseScore === 0) return sheet.settle();
+  contactAdjustments(a, b, sheet);
+  return sheet.settle();
 }
 function contactBlockingKeys(c) {
   const keys = [];
   if (c.linkedin) keys.push(`ln:${c.linkedin}`);
-  if (c.email) keys.push(`em:${c.email}`);
-  if (c.phoneTail) keys.push(`ph:${c.phoneTail}`);
+  for (const e of c.emails) keys.push(`em:${e}`);
+  for (const t of c.phoneTails) keys.push(`ph:${t}`);
   if (c.fullname && c.fullname.length >= 3) keys.push(`fn:${c.fullname}`);
   if (c.company) keys.push(`co:${c.company}`);
   if (c.associatedCompanyId) keys.push(`ac:${c.associatedCompanyId}`);
-  if (c.emailDomainCore) keys.push(`dc:${c.emailDomainCore}`);
+  if (c.emailDomainCore && !c.emailDomainPublic) keys.push(`dc:${c.emailDomainCore}`);
   return keys;
+}
+var ACCOUNT_KEY = /^(co|ac|dc):/;
+function contactRefineKeys(key, c) {
+  const account = ACCOUNT_KEY.test(key);
+  const out = contactBlockingKeys(c).filter((k) => k !== key && !(account && ACCOUNT_KEY.test(k)));
+  if (account) {
+    for (const t of new Set(`${c.first} ${c.last}`.split(" "))) {
+      if (t.length >= 2) out.push(`nt:${t}`);
+    }
+  }
+  return out;
+}
+function normSiren(v) {
+  const digits = str2(v).replace(/[\s.\-]/g, "");
+  const siren = /^\d{9}$/.test(digits) ? digits : /^\d{14}$/.test(digits) ? digits.slice(0, 9) : "";
+  return /^(\d)\1{8}$/.test(siren) ? "" : siren;
 }
 function normalizeCompany(id, p) {
   const domain = normDomain(p.domain || p.website);
+  const domains = splitMulti(domain, p.hs_additional_domains, normDomain);
   return {
     id: String(id),
-    name: normCompanyName(p.name),
+    name: normCompanyIdentity(p.name),
     domain,
     domainCore: domainCoreOf(domain),
+    domains,
+    domainCores: [...new Set(domains.map(domainCoreOf).filter(Boolean))],
     linkedin: normLinkedinCompanySlug(p.linkedin_company_page || p.hs_linkedin_handle),
     city: normName(p.city),
-    createdate: str2(p.createdate)
+    siren: normSiren(p.jipup_siren) || normSiren(p.siren),
+    createdate: str2(p.createdate),
+    country: normCountry(p.country),
+    zip: normZip(p.zip),
+    address: normAddress(p.address),
+    phoneTail: phoneTailOf(p.phone),
+    industry: normName(p.industry),
+    foundedYear: normYear(p.founded_year),
+    employees: normEmployees(p.numberofemployees),
+    parentId: str2(p.hs_parent_company_id)
   };
 }
+function parentSubsidiary(a, b) {
+  return Boolean(a.parentId) && a.parentId === b.id || Boolean(b.parentId) && b.parentId === a.id;
+}
+function companyAdjustments(a, b, sheet) {
+  const { bonus, malus, veto } = sheet;
+  if (differ(a.siren, b.siren)) veto("different_siren", a.siren, b.siren);
+  if (differ(a.linkedin, b.linkedin) && /^\d+$/.test(a.linkedin) === /^\d+$/.test(b.linkedin)) {
+    veto("different_company_linkedin", a.linkedin, b.linkedin);
+  }
+  if (both(a.phoneTail, b.phoneTail)) bonus("same_phone", COMPANY_BONUS.same_phone, [a.phoneTail]);
+  if (both(a.zip, b.zip)) bonus("same_zip", COMPANY_BONUS.same_zip, [a.zip]);
+  if (both(a.address, b.address)) bonus("same_address", COMPANY_BONUS.same_address, [a.address]);
+  if (both(a.industry, b.industry)) bonus("same_industry", COMPANY_BONUS.same_industry, [a.industry]);
+  if (both(a.country, b.country)) bonus("same_country", COMPANY_BONUS.same_country, [a.country]);
+  if (a.foundedYear !== null && a.foundedYear === b.foundedYear) {
+    bonus("same_founded_year", COMPANY_BONUS.same_founded_year, [String(a.foundedYear)]);
+  }
+  const sameCountry = both(a.country, b.country);
+  if (differ(a.country, b.country) && !sharedValue(a.domains, b.domains)) {
+    malus("different_country", COMPANY_MALUS.different_country, [a.country, b.country]);
+  }
+  if (a.foundedYear !== null && b.foundedYear !== null && Math.abs(a.foundedYear - b.foundedYear) > FOUNDED_YEAR_TOLERANCE) {
+    malus("different_founded_year", COMPANY_MALUS.different_founded_year, [String(a.foundedYear), String(b.foundedYear)]);
+  }
+  if (a.employees !== null && b.employees !== null && a.employees > EMPLOYEES_MIN && b.employees > EMPLOYEES_MIN && Math.max(a.employees, b.employees) / Math.min(a.employees, b.employees) > EMPLOYEES_RATIO) {
+    malus("incompatible_employees", COMPANY_MALUS.incompatible_employees, [String(a.employees), String(b.employees)]);
+  }
+  if (differ(a.zip, b.zip) && (sameCountry || !a.country && !b.country)) {
+    malus("different_zip", COMPANY_MALUS.different_zip, [a.zip, b.zip]);
+  }
+  if (differ(a.phoneTail, b.phoneTail)) malus("different_phone", COMPANY_MALUS.different_phone, [a.phoneTail, b.phoneTail]);
+}
 function scoreCompanyPair(a, b) {
-  if (!a.name && !a.domain || !b.name && !b.domain) return { score: 0, reasons: [] };
-  let score = 0;
-  const reasons = [];
-  const hit = (s, r) => {
-    reasons.push(r);
-    if (s > score) score = s;
-  };
+  if (!a.name && a.domains.length === 0 || !b.name && b.domains.length === 0) return EMPTY_SCORE();
+  if (parentSubsidiary(a, b)) return { ...EMPTY_SCORE(), excluded: "parent_subsidiary" };
+  const sheet = scoreSheet();
+  const { hit } = sheet;
   const nameEq = Boolean(a.name && a.name === b.name);
   const nameFuzzy = fuzzyCompanyName(a.name, b.name);
-  const domEq = Boolean(a.domain && a.domain === b.domain);
-  const coreEq = Boolean(a.domainCore && a.domainCore === b.domainCore);
-  if (domEq) hit(90, "same exact domain");
+  const sharedDomain = sharedValue(a.domains, b.domains);
+  const sharedCore = sharedValue(a.domainCores, b.domainCores);
+  const domEq = Boolean(sharedDomain);
+  const coreEq = Boolean(sharedCore);
+  const hasDomainA = a.domains.length > 0;
+  const hasDomainB = b.domains.length > 0;
+  if (a.siren && a.siren === b.siren) hit(95, "same_siren", [a.siren]);
+  if (domEq) hit(90, "same_domain", [sharedDomain]);
   if (a.linkedin && a.linkedin === b.linkedin) {
-    if (nameEq || nameFuzzy || domEq || coreEq)
-      hit(90, "same LinkedIn + name/domain corroboration");
-    else hit(75, "same LinkedIn (uncorroborated -> manual review)");
+    if (nameEq || nameFuzzy || domEq || coreEq) hit(90, "same_linkedin_corroborated", [a.linkedin]);
+    else hit(75, "same_linkedin_alone", [a.linkedin]);
   }
-  if (nameEq && coreEq) hit(80, "same name + same domain root");
-  if (coreEq && a.domain && b.domain && a.domain !== b.domain)
-    hit(80, "same domain root, different TLD");
-  if (nameEq && a.city && a.city === b.city) hit(75, "same name + same city");
-  if (nameFuzzy && domEq) hit(80, "fuzzy name + same exact domain");
-  if (!a.name && a.domain && coreEq || !b.name && b.domain && coreEq)
-    hit(80, "ghost record (missing name) + same domain root");
-  if ((nameEq || nameFuzzy) && (a.domain && !b.domain || !a.domain && b.domain))
-    hit(80, `${nameEq ? "same" : "fuzzy"} name + one side has no domain`);
-  if (nameEq && a.domainCore && b.domainCore && a.domainCore !== b.domainCore)
-    hit(80, "same name + different domain roots");
-  if (nameFuzzy && a.domainCore && b.domainCore && a.domainCore !== b.domainCore && a.domainCore.length >= 4 && b.domainCore.length >= 4 && levenshtein(a.domainCore, b.domainCore, 1) <= 1) {
-    hit(80, "fuzzy name + fuzzy domain root");
+  if (nameEq && coreEq) hit(80, "same_name_domain_root", [a.name, sharedCore]);
+  if (coreEq && !domEq) hit(80, "same_domain_root_other_tld", [sharedCore]);
+  if (nameEq && a.city && a.city === b.city) hit(75, "same_name_city", [a.name, a.city]);
+  if (nameFuzzy && domEq) hit(80, "fuzzy_name_same_domain", [sharedDomain]);
+  if ((!a.name || !b.name) && coreEq) hit(80, "ghost_domain_root", [sharedCore]);
+  if ((nameEq || nameFuzzy) && hasDomainA !== hasDomainB)
+    hit(80, nameEq ? "same_name_no_domain_one_side" : "fuzzy_name_no_domain_one_side", [nameEq ? a.name : ""]);
+  if (nameEq && a.domainCore && b.domainCore && !coreEq)
+    hit(80, "same_name_different_roots", [a.name]);
+  if (nameFuzzy && !coreEq && a.domainCore && b.domainCore && a.domainCore.length >= 4 && b.domainCore.length >= 4 && levenshtein(a.domainCore, b.domainCore, 1) <= 1) {
+    hit(80, "fuzzy_name_fuzzy_root");
   }
-  return { score, reasons };
+  if (sheet.out.baseScore === 0) return sheet.settle();
+  companyAdjustments(a, b, sheet);
+  return sheet.settle();
 }
 function companyBlockingKeys(c) {
   const keys = [];
-  if (c.domain) keys.push(`de:${c.domain}`);
-  if (c.domainCore) keys.push(`dc:${c.domainCore}`);
+  for (const d of c.domains) keys.push(`de:${d}`);
+  for (const d of c.domainCores) keys.push(`dc:${d}`);
   if (c.name) keys.push(`nm:${c.name}`);
   if (c.linkedin) keys.push(`li:${c.linkedin}`);
+  if (c.siren) keys.push(`sr:${c.siren}`);
   if (c.name.length >= 5) keys.push(`np:${c.name.slice(0, 4)}`);
   return keys;
 }
-function detectPairs(opts) {
-  const maxBlock = opts.maxBlock ?? 250;
-  const blocks = /* @__PURE__ */ new Map();
-  for (const rec of opts.records) {
-    for (const key of opts.keysOf(rec)) {
-      const list = blocks.get(key);
-      if (list) list.push(rec);
-      else blocks.set(key, [rec]);
-    }
+function deletionVariants(name) {
+  const out = /* @__PURE__ */ new Set([name]);
+  if (name.length > 40) return [...out];
+  for (let i = 0; i < name.length; i++) out.add(name.slice(0, i) + name.slice(i + 1));
+  return [...out];
+}
+var DOMAIN_KEY = /^(de|dc):/;
+function companyRefineKeys(key, c) {
+  const domain = DOMAIN_KEY.test(key);
+  const out = companyBlockingKeys(c).filter((k) => k !== key && !(domain && DOMAIN_KEY.test(k)));
+  if (key.startsWith("np:")) for (const v of deletionVariants(c.name)) out.push(`nd:${v}`);
+  if (key.startsWith("nm:") && c.city) out.push(`ci:${c.city}`);
+  return out;
+}
+var DEFAULT_MAX_BLOCK = 250;
+function hashKey(str3) {
+  let h1 = 3735928559;
+  let h2 = 1103547991;
+  for (let i = 0; i < str3.length; i++) {
+    const ch = str3.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
   }
-  const seen = /* @__PURE__ */ new Set();
-  const pairs = [];
-  for (const [key, list] of blocks) {
-    if (list.length < 2) continue;
-    if (list.length > maxBlock) {
+  h1 = Math.imul(h1 ^ h1 >>> 16, 2246822507);
+  h1 ^= Math.imul(h2 ^ h2 >>> 13, 3266489909);
+  h2 = Math.imul(h2 ^ h2 >>> 16, 2246822507);
+  h2 ^= Math.imul(h1 ^ h1 >>> 13, 3266489909);
+  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+function firstShared(x, y) {
+  let p = 0;
+  let q = 0;
+  while (p < x.length && q < y.length) {
+    if (x[p] === y[q]) return x[p];
+    if (x[p] < y[q]) p++;
+    else q++;
+  }
+  return -1;
+}
+var NO_REASONS = [];
+function detectPairs(opts) {
+  const maxBlock = opts.maxBlock ?? DEFAULT_MAX_BLOCK;
+  const recs = opts.records;
+  const bigNames = /* @__PURE__ */ new Map();
+  const push = (map, key, i) => {
+    const h = hashKey(key);
+    const cur = map.get(h);
+    if (cur === void 0) map.set(h, i);
+    else if (typeof cur === "number") {
+      if (cur !== i) map.set(h, [cur, i]);
+    } else if (cur[cur.length - 1] !== i) {
+      cur.push(i);
+      if (cur.length === maxBlock + 1) bigNames.set(h, key);
+    }
+  };
+  const sizeOf = (v) => v === void 0 ? 0 : typeof v === "number" ? 1 : v.length;
+  const byKey = /* @__PURE__ */ new Map();
+  recs.forEach((rec, i) => {
+    for (const key of opts.keysOf(rec)) push(byKey, key, i);
+  });
+  const blocks = [];
+  const bigBlocks = [];
+  for (const [h, list] of byKey) {
+    if (typeof list === "number") continue;
+    if (list.length <= maxBlock) blocks.push(list);
+    else bigBlocks.push({ key: bigNames.get(h), list });
+  }
+  for (const { key, list } of bigBlocks) {
+    if (!opts.refineKeys) {
       opts.onBlockSkipped?.(key, list.length);
       continue;
     }
+    opts.onBlockRefined?.(key, list.length);
+    const refined = /* @__PURE__ */ new Map();
+    for (const i of list) {
+      for (const sub of opts.refineKeys(key, recs[i])) {
+        const top = sizeOf(byKey.get(hashKey(sub)));
+        if (top > 0 && (top <= maxBlock || sub < key)) continue;
+        push(refined, `${key}|${sub}`, i);
+      }
+    }
+    for (const [h, sub] of refined) {
+      if (typeof sub === "number") continue;
+      if (sub.length <= maxBlock) blocks.push(sub);
+      else opts.onBlockSkipped?.(bigNames.get(h), sub.length);
+    }
+  }
+  byKey.clear();
+  const memberOf = recs.map(() => []);
+  blocks.forEach((list, b) => {
+    for (const i of list) {
+      const m = memberOf[i];
+      if (m[m.length - 1] !== b) m.push(b);
+    }
+  });
+  const keepReasons = opts.keepReasons !== false;
+  const pairs = [];
+  for (let b = 0; b < blocks.length; b++) {
+    const list = blocks[b];
     for (let i = 0; i < list.length; i++) {
       for (let j = i + 1; j < list.length; j++) {
-        const a = list[i];
-        const b = list[j];
-        if (a.id === b.id) continue;
-        const pairKey = a.id < b.id ? `${a.id}|${b.id}` : `${b.id}|${a.id}`;
-        if (seen.has(pairKey)) continue;
-        seen.add(pairKey);
-        const { score, reasons } = opts.score(a, b);
-        if (score >= opts.minScore) {
-          pairs.push({ aId: a.id, bId: b.id, score, reasons });
+        const ia = list[i];
+        const ib = list[j];
+        if (ia === ib) continue;
+        const a = recs[ia];
+        const c = recs[ib];
+        if (a.id === c.id) continue;
+        if (firstShared(memberOf[ia], memberOf[ib]) !== b) continue;
+        const { score, baseScore, reasons, excluded } = opts.score(a, c);
+        if (excluded) {
+          opts.onPairExcluded?.(a, c, excluded);
+          continue;
+        }
+        if ((baseScore ?? score) >= opts.minScore) {
+          pairs.push({ aId: a.id, bId: c.id, score, reasons: keepReasons ? reasons : NO_REASONS });
         }
       }
     }
@@ -2168,25 +3425,28 @@ function detectPairs(opts) {
 var FREQ_GUARD_MIN_HOLDERS = 6;
 var FREQ_GUARD_MIN_LABELS = 3;
 var CONTACT_SIGNALS = [
-  { prefix: "ln", get: (c) => c.linkedin },
-  { prefix: "em", get: (c) => c.email },
-  { prefix: "ph", get: (c) => c.phoneTail }
+  { prefix: "ln", get: (c) => [c.linkedin] },
+  { prefix: "em", get: (c) => c.emails },
+  { prefix: "ph", get: (c) => c.phoneTails }
 ];
 var COMPANY_SIGNALS = [
-  { prefix: "de", get: (c) => c.domain },
-  { prefix: "dc", get: (c) => c.domainCore },
-  { prefix: "li", get: (c) => c.linkedin }
+  { prefix: "de", get: (c) => c.domains },
+  { prefix: "dc", get: (c) => c.domainCores },
+  { prefix: "li", get: (c) => [c.linkedin] },
+  // A group's SIREN pasted on its subsidiaries, a placeholder typed everywhere.
+  { prefix: "sr", get: (c) => [c.siren] }
 ];
 function findDisqualified(records, fields, labelOf, minHolders, minLabels) {
   const out = [];
   for (const f of fields) {
     const holders = /* @__PURE__ */ new Map();
     for (const r of records) {
-      const v = f.get(r);
-      if (!v) continue;
-      const list = holders.get(v);
-      if (list) list.push(r);
-      else holders.set(v, [r]);
+      for (const v of f.get(r)) {
+        if (!v) continue;
+        const list = holders.get(v);
+        if (list) list.push(r);
+        else holders.set(v, [r]);
+      }
     }
     for (const [v, recs] of holders) {
       if (recs.length < minHolders) continue;
@@ -2207,8 +3467,12 @@ function scrubContactSignals(c, keys) {
     c.emailLocalCore = "";
     c.emailDomain = "";
     c.emailDomainCore = "";
+    c.emailDomainPublic = false;
   }
-  if (c.phoneTail && keys.has(`ph:${c.phoneTail}`)) c.phoneTail = "";
+  c.emails = c.emails.filter((e) => !keys.has(`em:${e}`));
+  if (c.mobileTail && keys.has(`ph:${c.mobileTail}`)) c.mobileTail = "";
+  if (c.landlineTail && keys.has(`ph:${c.landlineTail}`)) c.landlineTail = "";
+  c.phoneTails = c.phoneTails.filter((t) => !keys.has(`ph:${t}`));
   return c;
 }
 function scrubCompanySignals(c, keys) {
@@ -2218,52 +3482,76 @@ function scrubCompanySignals(c, keys) {
     c.domainCore = "";
   }
   if (c.domainCore && keys.has(`dc:${c.domainCore}`)) c.domainCore = "";
+  c.domains = c.domains.filter((d) => !keys.has(`de:${d}`));
+  c.domainCores = c.domainCores.filter((d) => !keys.has(`dc:${d}`));
   if (c.linkedin && keys.has(`li:${c.linkedin}`)) c.linkedin = "";
+  if (c.siren && keys.has(`sr:${c.siren}`)) c.siren = "";
   return c;
 }
-function detectDuplicates(object, records, opts) {
+function normalizeRecord(object, rec) {
+  return object === "contact" ? normalizeContact(rec.id, rec.properties ?? {}) : normalizeCompany(rec.id, rec.properties ?? {});
+}
+function detectNormalized(object, normed, opts) {
   const minHolders = opts?.minHolders ?? FREQ_GUARD_MIN_HOLDERS;
   const minLabels = opts?.minLabels ?? FREQ_GUARD_MIN_LABELS;
+  const refinedBlocks = [];
+  const skippedBlocks = [];
+  let excludedPairs = 0;
+  const blockOpts = {
+    maxBlock: opts?.maxBlock,
+    keepReasons: opts?.keepReasons,
+    onBlockRefined: (key, size) => refinedBlocks.push({ key, size }),
+    onBlockSkipped: (key, size) => {
+      skippedBlocks.push({ key, size });
+      opts?.onBlockSkipped?.(key, size);
+    },
+    onPairExcluded: () => {
+      excludedPairs++;
+    }
+  };
   if (object === "contact") {
-    const normed2 = records.map((r) => normalizeContact(r.id, r.properties ?? {}));
+    const contacts = normed;
     const disqualified2 = findDisqualified(
-      normed2,
+      contacts,
       CONTACT_SIGNALS,
       (c) => c.fullname,
       minHolders,
       minLabels
     );
     const keys2 = new Set(disqualified2.map((d) => d.key));
-    for (const c of normed2) scrubContactSignals(c, keys2);
+    for (const c of contacts) scrubContactSignals(c, keys2);
     const pairs2 = detectPairs({
-      records: normed2,
+      records: contacts,
       keysOf: contactBlockingKeys,
+      refineKeys: contactRefineKeys,
       score: scoreContactPair,
       minScore: MIN_SCORE_TO_CONSIDER.contact,
-      maxBlock: opts?.maxBlock,
-      onBlockSkipped: opts?.onBlockSkipped
+      ...blockOpts
     });
-    return { pairs: pairs2, disqualified: disqualified2 };
+    return { pairs: pairs2, disqualified: disqualified2, refinedBlocks, skippedBlocks, excludedPairs };
   }
-  const normed = records.map((r) => normalizeCompany(r.id, r.properties ?? {}));
+  const companies = normed;
   const disqualified = findDisqualified(
-    normed,
+    companies,
     COMPANY_SIGNALS,
     (c) => c.name,
     minHolders,
     minLabels
   );
   const keys = new Set(disqualified.map((d) => d.key));
-  for (const c of normed) scrubCompanySignals(c, keys);
+  for (const c of companies) scrubCompanySignals(c, keys);
   const pairs = detectPairs({
-    records: normed,
+    records: companies,
     keysOf: companyBlockingKeys,
+    refineKeys: companyRefineKeys,
     score: scoreCompanyPair,
     minScore: MIN_SCORE_TO_CONSIDER.company,
-    maxBlock: opts?.maxBlock,
-    onBlockSkipped: opts?.onBlockSkipped
+    ...blockOpts
   });
-  return { pairs, disqualified };
+  return { pairs, disqualified, refinedBlocks, skippedBlocks, excludedPairs };
+}
+function detectDuplicates(object, records, opts) {
+  return detectNormalized(object, records.map((r) => normalizeRecord(object, r)), opts);
 }
 
 // engine/audit/checks/duplicates.ts

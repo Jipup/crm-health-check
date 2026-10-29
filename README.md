@@ -63,7 +63,7 @@ evidence with deep links into your portal.
 | Structure | Records without owners, ownerless distribution |
 | Freshness | How recently records were touched |
 | Staleness | Contacts likely obsolete (job changes) |
-| Deliverability | Hard bounces, unsubscribed share |
+| Deliverability | Hard bounces, unsubscribed share, ghost contacts (10+ marketing emails, never opened), marketing contacts billed but unreachable |
 | Pipeline | Zombie deals, stage hygiene |
 | Schema debt | Ghost custom properties nobody fills |
 
@@ -81,5 +81,5 @@ this repo ships the build, regenerated from that source on every release.
 
 ---
 
-Built by [Jipup](https://crm.jipup.com) — AI agents that keep your CRM clean,
+Built by [Jipup](https://jipup.com) — AI agents that keep your CRM clean,
 enriched, and up to date automatically.
