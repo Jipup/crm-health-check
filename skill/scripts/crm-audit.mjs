@@ -234,7 +234,7 @@ var FR = {
   },
   footer: (d) => `Rapport g\xE9n\xE9r\xE9 le ${d}. Aucune donn\xE9e n'a \xE9t\xE9 modifi\xE9e dans HubSpot.`,
   privacy: "Cet audit s'est ex\xE9cut\xE9 en local, en lecture seule, exclusivement contre api.hubapi.com. Aucune donn\xE9e CRM n'a quitt\xE9 votre machine.",
-  cleanup: "Vous pouvez maintenant supprimer l'application priv\xE9e dans HubSpot (Param\xE8tres \u2192 Int\xE9grations \u2192 Applications priv\xE9es) \u2014 le token meurt avec elle.",
+  cleanup: "Vous pouvez maintenant supprimer la cl\xE9 de service dans HubSpot (D\xE9veloppement \u2192 Cl\xE9s \u2192 Cl\xE9s de service) \u2014 le token meurt avec elle.",
   cta: "Jipup automatise ces corrections \u2014 d\xE9doublonnage & fusion, enrichissement, suivi des changements de poste \u2014 et peut importer ce rapport \xE0 l'inscription.",
   ctaLink: "Corriger automatiquement avec Jipup",
   builtBy: "R\xE9alis\xE9 par"
@@ -438,7 +438,7 @@ var EN = {
   },
   footer: (d) => `Report generated on ${d}. No data was modified in HubSpot.`,
   privacy: "This audit ran locally, read-only, exclusively against api.hubapi.com. No CRM data left your machine.",
-  cleanup: "You can now delete the private app in HubSpot (Settings \u2192 Integrations \u2192 Private Apps) \u2014 the token dies with it.",
+  cleanup: "You can now delete the service key in HubSpot (Development \u2192 Keys \u2192 Service keys) \u2014 the token dies with it.",
   cta: "Jipup automates these fixes \u2014 dedup & merge, enrichment, job-change tracking \u2014 and can import this report at signup.",
   ctaLink: "Fix this automatically with Jipup",
   builtBy: "Built by"

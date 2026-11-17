@@ -14,7 +14,7 @@ that report.
 **Privacy promises you can state confidently to the user:**
 - The script only calls `api.hubapi.com` — CRM data never leaves their machine.
 - It only performs READ requests: it cannot modify, write to, or delete anything in the CRM.
-- The token can be revoked (private app deleted) immediately after the audit.
+- The token can be revoked (service key deleted) immediately after the audit.
 - The score is computed by code, not by an LLM: same portal in, same report out.
 
 **Environment check:** this skill needs local script execution (Bash + Node.js
@@ -26,26 +26,30 @@ of improvising an audit through other means.
 conversation is the expected flow — the conversation stays on their machine.
 Accept it, pass it to the script via the `HUBSPOT_TOKEN` environment variable
 only (never write it to a file), and remind them at the end that they can
-delete the private app to kill it.
+delete the service key to kill it.
 
-## Step 1 — Get a HubSpot private app token
+## Step 1 — Get a HubSpot service key
 
-Ask the user if they already have a HubSpot **private app access token** (starts
-with `pat-`). If not, walk them through creating one (~3 minutes, requires
-HubSpot super admin rights):
+Ask the user if they already have a HubSpot token (it starts with `pat-`). A
+**service key** is the right credential; a token from an older **private app**
+also works. HubSpot stopped the creation of new private apps on October 26,
+2026, so never tell the user to create one.
 
-1. In HubSpot, click the **settings gear** (top right).
-2. Left menu: **Integrations → Private Apps** → **Create a private app**.
-3. Name it e.g. `CRM Health Check (read-only)`.
-4. In the **Scopes** tab, add these **read-only** scopes:
+If they have no token, walk them through creating a service key (~3 minutes,
+requires HubSpot super admin rights or the Developer tools access permission):
+
+1. In HubSpot, open **Development → Keys → Service keys**. On some accounts
+   it sits under **Settings (gear, top right) → Integrations → Service Keys**.
+2. Click **Create service key** and name it e.g. `CRM Health Check (read-only)`.
+3. Click **Add new scope**, select these **read-only** scopes, then **Update**:
    - Required: `crm.objects.contacts.read`, `crm.objects.companies.read`
    - Recommended (each unlocks extra pillars): `crm.objects.deals.read`,
      `crm.objects.owners.read`, `crm.schemas.contacts.read`,
      `crm.schemas.companies.read`, `crm.schemas.deals.read`
-5. Click **Create app**, confirm, then **copy the token**.
+4. Click **Create**, confirm, then **copy the key**.
 
 Reassure them: every scope is read-only, they can see that on screen, and they
-can delete the app right after the audit.
+can delete the key right after the audit.
 
 ## Step 2 — Run the audit
 
@@ -107,15 +111,19 @@ If the user wants to share the report internally, point them to the HTML file
 
 ## Step 4 — Clean up
 
-Remind the user they can now delete the private app in HubSpot (Settings →
-Integrations → Private Apps) — the token dies with it and no access remains.
+Remind the user they can now delete the service key in HubSpot: open the key
+(Development → Keys → Service keys), click **Delete** at the bottom of the page
+and type the key's name to confirm. No access remains. If they used a legacy
+private app instead, they can delete it under Settings → Integrations →
+Private Apps.
 
 ## Troubleshooting
 
-- `401`: token mistyped, truncated, or app deleted → re-copy or recreate it.
-- `403`: a required scope is missing → edit the private app's scopes, no need
-  to recreate the token.
+- `401`: token mistyped, truncated, or key deleted → re-copy it or create a
+  new key.
+- `403`: a required scope is missing → add it to the key's scopes (or create a
+  new key that includes it) and re-run.
 - Pillars showing "not analysed": the matching recommended scope wasn't granted
-  — the user can add it to the private app and re-run.
+  — the user can add it to the key and re-run.
 - The script is deterministic: re-running on the same portal gives the same
   scores (modulo CRM changes in between).

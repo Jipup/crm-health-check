@@ -11,7 +11,7 @@ to any third party.
   9 pillars (duplicates, completeness, quality, structure, freshness,
   staleness, deliverability, pipeline hygiene, schema debt), a 0–100 score,
   a waste estimate in euros, and a record-by-record remediation plan.
-- 🗑️ **Revocable in one click.** The audit uses a HubSpot private app token you
+- 🗑️ **Revocable in one click.** The audit uses a HubSpot service key you
   create with read-only scopes and can delete right after.
 
 ![CRM Health Check dashboard](docs/dashboard-en.png)
@@ -39,8 +39,9 @@ to any third party.
 
 ## Quick start (script only, no Claude)
 
-Requires Node.js >= 18. Create a HubSpot private app
-(Settings → Integrations → Private Apps) with these read-only scopes —
+Requires Node.js >= 18. Create a HubSpot service key
+(Development → Keys → Service keys, or Settings → Integrations → Service Keys
+depending on your account) with these read-only scopes —
 required: `crm.objects.contacts.read`, `crm.objects.companies.read`;
 recommended: `crm.objects.deals.read`, `crm.objects.owners.read`,
 `crm.schemas.contacts.read`, `crm.schemas.companies.read`,
@@ -49,6 +50,9 @@ recommended: `crm.objects.deals.read`, `crm.objects.owners.read`,
 ```bash
 HUBSPOT_TOKEN=pat-xx-xxxx node skill/scripts/crm-audit.mjs --out crm-audit-report.json
 ```
+
+Already have a legacy private app token? It still works: HubSpot stopped the
+creation of new private apps on October 26, 2026, but existing ones keep running.
 
 The console prints a summary; the JSON file holds the full report and sample
 evidence with deep links into your portal.
