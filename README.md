@@ -4,20 +4,20 @@ A **read-only** audit of your HubSpot CRM that runs **on your machine**, inside
 a tool you already use (Claude Code / Claude Desktop). No signup, no data sent
 to any third party.
 
-- 🔒 **Your data never leaves your machine.** The script talks only to
+- **Your data never leaves your machine.** The script talks only to
   `api.hubapi.com` and only performs read requests. [Read the code](skill/scripts/crm-audit.mjs):
   it's one file.
-- 🎯 **Deterministic scoring.** The report is computed by code, not by an LLM:
+- **Deterministic scoring.** The report is computed by code, not by an LLM:
   how many contacts your team can actually use (activable contacts), a 0 to
   100 score, the five problems to fix first ranked by impact with sample
   records linked to HubSpot, where those records came from (imports, forms,
   integrations…), a revenue-impact estimate, and every check of the 9 pillars
   (duplicates, completeness, quality, structure, freshness, staleness,
   deliverability, pipeline hygiene, schema debt).
-- 🗑️ **Revocable in one click.** The audit uses a HubSpot private app token you
+- **Revocable in one click.** The audit uses a HubSpot private app token you
   create with read-only scopes and can delete right after.
 
-![CRM Health Check dashboard](docs/dashboard-en.png)
+![CRM Health Check dashboard](docs/report-en.png)
 
 ## Quick start (as a Claude skill)
 

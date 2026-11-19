@@ -8329,7 +8329,7 @@ Run with --help for usage.`);
 }
 function fail(message) {
   console.error(`
-\u274C ${message}`);
+Error: ${message}`);
   process.exit(1);
 }
 async function preflight(token) {
@@ -8383,7 +8383,7 @@ async function main() {
     const htmlPath2 = htmlPathFor(jsonPath);
     writeFileSync(htmlPath2, renderReportHtml(data.report, data.evidence ?? [], parsed.lang));
     if (parsed.open) openInBrowser(htmlPath2);
-    console.log(`\u{1F4CA} Report: ${pathToFileURL(htmlPath2).href}`);
+    console.log(`Report: ${pathToFileURL(htmlPath2).href}`);
     return;
   }
   if (!parsed.token) {
@@ -8391,7 +8391,7 @@ async function main() {
       "No token provided. Set the HUBSPOT_TOKEN environment variable or pass --token.\n\nRun with --help for how to create a read-only private app token."
     );
   }
-  console.error("\u{1F50D} CRM Health Check: read-only audit, nothing is written to your CRM.\n");
+  console.error("CRM Health Check: read-only audit, nothing is written to your CRM.\n");
   await preflight(parsed.token);
   let lastLine = "";
   const onProgress = (pct, step) => {
@@ -8427,7 +8427,7 @@ async function main() {
   const skipped = report.pillars.filter((p) => p.score === null);
   console.error(`[100%] Done.
 `);
-  console.log(`\u2705 Audit complete. Health score: ${report.score}/100`);
+  console.log(`Audit complete. Health score: ${report.score}/100`);
   const a = report.activation;
   if (a) {
     console.log(
@@ -8463,8 +8463,8 @@ async function main() {
   }
   if (parsed.open) openInBrowser(htmlPath);
   console.log(`
-\u{1F4C4} Data:      ${outPath}`);
-  console.log(`\u{1F4CA} Dashboard: ${pathToFileURL(htmlPath).href}`);
+Data:      ${outPath}`);
+  console.log(`Dashboard: ${pathToFileURL(htmlPath).href}`);
   console.log(
     parsed.open ? `   The dashboard was opened in the default browser. If it did not appear, open the URL above.` : `   Open the URL above in a browser to view the dashboard.`
   );
